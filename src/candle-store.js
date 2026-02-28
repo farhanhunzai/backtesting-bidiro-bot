@@ -88,10 +88,35 @@ class CandleStore {
         const lookbackDays = Math.max(1, Math.floor(toNumber(options.lookbackDays, DEFAULTS.lookbackDays)));
         const endTime = toNumber(options.endTime, nowMs()) || nowMs();
         const startTime = toNumber(options.startTime, endTime - lookbackDays * 24 * 60 * 60 * 1000);
+        const normalizedRows = await this.fetchRangeRows(upperSymbol, normalized, normalizedInterval, startTime, endTime, intervalMs);
+
+        this.cache.set(key, {
+            fetchedAt: nowMs(),
+            startTime,
+            endTime,
+            candles: normalizedRows,
+        });
+        return normalizedRows;
+    }
+
+    async fetchRangeRows(
+        symbol = "",
+        accountType = ACCOUNT_TYPES.SPOT,
+        interval = DEFAULTS.interval,
+        startTime = 0,
+        endTime = 0,
+        intervalMsHint = 0
+    ) {
+        const upperSymbol = (symbol || "").toUpperCase();
+        const normalizedAccountType = normalizeAccountType(accountType);
+        const normalizedInterval = normalizeInterval(interval || DEFAULTS.interval);
+        const intervalMs = Math.max(60 * 1000, intervalMsHint || intervalToMs(normalizedInterval));
+        const safeStart = Math.max(0, toNumber(startTime, 0));
+        const safeEnd = Math.max(safeStart, toNumber(endTime, nowMs()) || nowMs());
         const limitPerCall = 1000;
         const allRows = [];
-        let cursor = startTime;
-        const hardStop = endTime + 1;
+        let cursor = safeStart;
+        const hardStop = safeEnd + 1;
 
         while (cursor < hardStop) {
             const batch = await this.binanceClient.getKlines(
@@ -99,10 +124,10 @@ class CandleStore {
                     symbol: upperSymbol,
                     interval: normalizedInterval,
                     startTime: cursor,
-                    endTime,
+                    endTime: safeEnd,
                     limit: limitPerCall,
                 },
-                normalized
+                normalizedAccountType
             );
             if (!Array.isArray(batch) || !batch.length) {
                 break;
@@ -122,19 +147,11 @@ class CandleStore {
         const byOpenTime = new Map();
         allRows
             .map((row) => this.parseRow(row))
-            .filter((row) => row && row.openTime >= startTime && row.openTime <= endTime)
+            .filter((row) => row && row.openTime >= safeStart && row.openTime <= safeEnd)
             .forEach((row) => {
                 byOpenTime.set(row.openTime, row);
             });
-        const normalizedRows = Array.from(byOpenTime.values()).sort((a, b) => a.openTime - b.openTime);
-
-        this.cache.set(key, {
-            fetchedAt: nowMs(),
-            startTime,
-            endTime,
-            candles: normalizedRows,
-        });
-        return normalizedRows;
+        return Array.from(byOpenTime.values()).sort((a, b) => a.openTime - b.openTime);
     }
 
     async ensureRange(symbol, accountType = ACCOUNT_TYPES.SPOT, interval = DEFAULTS.interval, options = {}) {
@@ -150,7 +167,8 @@ class CandleStore {
         const endTime = explicitEndTime > 0 ? explicitEndTime : toNumber(cached?.endTime, nowMs()) || nowMs();
         const lookbackDays = Math.max(1, Math.floor(toNumber(options.lookbackDays, DEFAULTS.lookbackDays)));
         const startTime = toNumber(options.startTime, endTime - lookbackDays * 24 * 60 * 60 * 1000);
-        const toleranceMs = Math.max(2 * 60 * 1000, intervalToMs(normalizedInterval) * 2);
+        const intervalMs = Math.max(60 * 1000, intervalToMs(normalizedInterval));
+        const toleranceMs = Math.max(2 * 60 * 1000, intervalMs * 2);
         const hasCoverage =
             cached &&
             Array.isArray(cached.candles) &&
@@ -160,6 +178,50 @@ class CandleStore {
         if (hasCoverage) {
             return cached.candles;
         }
+
+        const canExtendForward =
+            cached &&
+            Array.isArray(cached.candles) &&
+            cached.candles.length > 0 &&
+            toNumber(cached.startTime, 0) <= startTime &&
+            toNumber(cached.endTime, 0) < endTime;
+        if (canExtendForward) {
+            const missingStart = Math.max(startTime, toNumber(cached.endTime, 0) + intervalMs);
+            const existingRows = Array.isArray(cached.candles) ? cached.candles : [];
+            if (missingStart > endTime) {
+                return existingRows;
+            }
+            const additionalRows = await this.fetchRangeRows(
+                upperSymbol,
+                normalized,
+                normalizedInterval,
+                missingStart,
+                endTime,
+                intervalMs
+            );
+            const byOpenTime = new Map();
+            existingRows.forEach((row) => {
+                const openTime = toNumber(row?.openTime, 0);
+                if (openTime > 0) {
+                    byOpenTime.set(openTime, row);
+                }
+            });
+            additionalRows.forEach((row) => {
+                const openTime = toNumber(row?.openTime, 0);
+                if (openTime > 0) {
+                    byOpenTime.set(openTime, row);
+                }
+            });
+            const merged = Array.from(byOpenTime.values()).sort((a, b) => a.openTime - b.openTime);
+            this.cache.set(key, {
+                fetchedAt: nowMs(),
+                startTime: Math.min(toNumber(cached.startTime, startTime), startTime),
+                endTime,
+                candles: merged,
+            });
+            return merged;
+        }
+
         return await this.fetchAndCacheRange(upperSymbol, normalized, normalizedInterval, {
             startTime,
             endTime,

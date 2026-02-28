@@ -106,7 +106,7 @@ function createRoutes({ binanceClient, candleStore, replayEngine }) {
                     accountType,
                     symbol,
                     interval,
-                    loadNow: true,
+                    loadNow: false,
                 });
             }
 

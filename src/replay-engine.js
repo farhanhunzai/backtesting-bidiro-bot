@@ -269,8 +269,28 @@ class ReplayEngine extends EventEmitter {
         if (!session || !state || !state.active) {
             return;
         }
-        const needsReload = !state.loaded || state.windowStart !== session.startTime || state.windowEnd !== session.endTime;
-        if (!needsReload) {
+        const intervalMs = Math.max(60 * 1000, intervalToMs(state.interval || session.baseInterval || DEFAULTS.interval));
+        const chunkCandles = Math.max(500, Math.floor(toNumber(process.env.BACKTEST_STREAM_CHUNK_CANDLES, 2000)));
+        const prefetchCandles = Math.max(100, Math.floor(toNumber(process.env.BACKTEST_STREAM_PREFETCH_CANDLES, 300)));
+        const chunkMs = intervalMs * chunkCandles;
+        const prefetchLeadMs = intervalMs * prefetchCandles;
+        const desiredStart = session.startTime;
+
+        let desiredEnd = 0;
+        if (!state.loaded || !state.windowEnd || state.windowStart !== desiredStart) {
+            desiredEnd = Math.min(session.endTime, desiredStart + chunkMs);
+        } else {
+            const shouldExtend =
+                state.windowEnd < session.endTime &&
+                toNumber(session.replayClockMs, 0) >= (state.windowEnd - prefetchLeadMs);
+            if (!shouldExtend) {
+                this.syncStreamCursorWithClock(session, state);
+                return;
+            }
+            desiredEnd = Math.min(session.endTime, state.windowEnd + chunkMs);
+        }
+
+        if (state.loaded && state.windowStart === desiredStart && state.windowEnd >= desiredEnd) {
             this.syncStreamCursorWithClock(session, state);
             return;
         }
@@ -280,16 +300,16 @@ class ReplayEngine extends EventEmitter {
         }
         state.loadingPromise = (async () => {
             const candles = await this.candleStore.ensureRange(state.symbol, session.accountType, state.interval, {
-                startTime: session.startTime,
-                endTime: session.endTime,
+                startTime: desiredStart,
+                endTime: desiredEnd,
                 lookbackDays: session.lookbackDays,
             });
             state.candles = (candles || [])
-                .filter((candle) => toNumber(candle?.openTime, 0) >= session.startTime && toNumber(candle?.openTime, 0) <= session.endTime)
+                .filter((candle) => toNumber(candle?.openTime, 0) >= desiredStart && toNumber(candle?.openTime, 0) <= desiredEnd)
                 .sort((a, b) => toNumber(a?.openTime, 0) - toNumber(b?.openTime, 0));
             state.loaded = true;
-            state.windowStart = session.startTime;
-            state.windowEnd = session.endTime;
+            state.windowStart = desiredStart;
+            state.windowEnd = desiredEnd;
             this.syncStreamCursorWithClock(session, state);
         })();
         try {
