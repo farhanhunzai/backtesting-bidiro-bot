@@ -1,7 +1,14 @@
 "use strict";
 
 const express = require("express");
-const { ACCOUNT_TYPES, DEFAULTS, normalizeAccountType } = require("./constants");
+const {
+    ACCOUNT_TYPES,
+    DEFAULTS,
+    normalizeAccountType,
+    normalizeInterval,
+    isSupportedInterval,
+    getAllowedIntervals,
+} = require("./constants");
 const { clamp, nowMs, toNumber, uniq } = require("./utils");
 
 function normalizeSymbols(input = []) {
@@ -81,23 +88,31 @@ function createRoutes({ binanceClient, candleStore, replayEngine }) {
     const handleKlines = async (req, res, accountType) => {
         try {
             const symbol = (req.query.symbol || "").toString().toUpperCase();
-            const interval = (req.query.interval || DEFAULTS.interval).toString();
+            const interval = normalizeInterval(req.query.interval || DEFAULTS.interval);
             if (!symbol) {
                 return res.status(400).json({
                     code: "BAD_SYMBOL",
                     msg: "symbol is required",
                 });
             }
-            if (interval !== DEFAULTS.interval) {
+            if (!isSupportedInterval(interval)) {
                 return res.status(400).json({
                     code: "UNSUPPORTED_INTERVAL",
-                    msg: "Only 1m interval is supported in backtest engine.",
+                    msg: `Unsupported interval. Allowed: ${getAllowedIntervals().join(", ")}`,
+                });
+            }
+            if (replayEngine.isRunning(accountType)) {
+                await replayEngine.ensureStream({
+                    accountType,
+                    symbol,
+                    interval,
+                    loadNow: true,
                 });
             }
 
             const requestedStartTime = toNumber(req.query.startTime, 0) || undefined;
             let requestedEndTime = toNumber(req.query.endTime, 0) || undefined;
-            const replayVisibleEndMs = replayEngine.getSessionVisibleEndTimeMs(accountType, symbol);
+            const replayVisibleEndMs = replayEngine.getSessionVisibleEndTimeMs(accountType, symbol, interval);
             if (typeof replayVisibleEndMs === "number") {
                 if (replayVisibleEndMs < 0) {
                     return res.status(200).json([]);
@@ -152,7 +167,8 @@ function createRoutes({ binanceClient, candleStore, replayEngine }) {
                         askQty: "100",
                     };
                 }
-                const fallback = candleStore.getLatestClose(tickerSymbol, normalized, DEFAULTS.interval);
+                const fallback = candleStore.getLatestCloseAnyInterval(tickerSymbol, normalized) ||
+                    candleStore.getLatestClose(tickerSymbol, normalized, DEFAULTS.interval);
                 if (!fallback) {
                     return null;
                 }
@@ -214,19 +230,10 @@ function createRoutes({ binanceClient, candleStore, replayEngine }) {
             const accountType = normalizeAccountType(body.accountType || ACCOUNT_TYPES.FUTURES);
             const speedMultiplier = Math.max(1, Math.floor(toNumber(body.speedMultiplier, DEFAULTS.speedMultiplier)));
             const lookbackDays = Math.max(1, Math.floor(toNumber(body.lookbackDays, DEFAULTS.lookbackDays)));
-            const symbols = normalizeSymbols(body.symbols || []);
-            if (!symbols.length) {
-                return res.status(400).json({
-                    success: false,
-                    message: "symbols is required",
-                });
-            }
             const status = await replayEngine.start({
                 accountType,
-                symbols,
                 speedMultiplier,
                 lookbackDays,
-                interval: DEFAULTS.interval,
             });
             return res.status(200).json({
                 success: true,

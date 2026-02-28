@@ -1,6 +1,13 @@
 "use strict";
 
-const { ACCOUNT_TYPES, DEFAULTS, normalizeAccountType } = require("./constants");
+const {
+    ACCOUNT_TYPES,
+    DEFAULTS,
+    normalizeAccountType,
+    normalizeInterval,
+    intervalToMs,
+    isSupportedInterval,
+} = require("./constants");
 const { clamp, nowMs, toNumber } = require("./utils");
 
 class CandleStore {
@@ -11,7 +18,8 @@ class CandleStore {
 
     buildKey(accountType = ACCOUNT_TYPES.SPOT, symbol = "", interval = DEFAULTS.interval) {
         const normalized = normalizeAccountType(accountType);
-        return `${normalized}:${(symbol || "").toUpperCase()}:${interval}`;
+        const normalizedInterval = normalizeInterval(interval || DEFAULTS.interval);
+        return `${normalized}:${(symbol || "").toUpperCase()}:${normalizedInterval}`;
     }
 
     parseRow(row = []) {
@@ -71,7 +79,12 @@ class CandleStore {
     async fetchAndCacheRange(symbol, accountType = ACCOUNT_TYPES.SPOT, interval = DEFAULTS.interval, options = {}) {
         const upperSymbol = (symbol || "").toUpperCase();
         const normalized = normalizeAccountType(accountType);
-        const key = this.buildKey(normalized, upperSymbol, interval);
+        const normalizedInterval = normalizeInterval(interval || DEFAULTS.interval);
+        if (!isSupportedInterval(normalizedInterval)) {
+            throw new Error(`Unsupported interval: ${normalizedInterval}`);
+        }
+        const key = this.buildKey(normalized, upperSymbol, normalizedInterval);
+        const intervalMs = Math.max(60 * 1000, intervalToMs(normalizedInterval));
         const lookbackDays = Math.max(1, Math.floor(toNumber(options.lookbackDays, DEFAULTS.lookbackDays)));
         const endTime = toNumber(options.endTime, nowMs()) || nowMs();
         const startTime = toNumber(options.startTime, endTime - lookbackDays * 24 * 60 * 60 * 1000);
@@ -84,7 +97,7 @@ class CandleStore {
             const batch = await this.binanceClient.getKlines(
                 {
                     symbol: upperSymbol,
-                    interval,
+                    interval: normalizedInterval,
                     startTime: cursor,
                     endTime,
                     limit: limitPerCall,
@@ -99,13 +112,21 @@ class CandleStore {
             if (!lastOpenTime || batch.length < limitPerCall) {
                 break;
             }
-            cursor = lastOpenTime + 60 * 1000;
+            const nextCursor = lastOpenTime + intervalMs;
+            if (nextCursor <= cursor) {
+                break;
+            }
+            cursor = nextCursor;
         }
 
-        const normalizedRows = allRows
+        const byOpenTime = new Map();
+        allRows
             .map((row) => this.parseRow(row))
             .filter((row) => row && row.openTime >= startTime && row.openTime <= endTime)
-            .sort((a, b) => a.openTime - b.openTime);
+            .forEach((row) => {
+                byOpenTime.set(row.openTime, row);
+            });
+        const normalizedRows = Array.from(byOpenTime.values()).sort((a, b) => a.openTime - b.openTime);
 
         this.cache.set(key, {
             fetchedAt: nowMs(),
@@ -119,13 +140,17 @@ class CandleStore {
     async ensureRange(symbol, accountType = ACCOUNT_TYPES.SPOT, interval = DEFAULTS.interval, options = {}) {
         const upperSymbol = (symbol || "").toUpperCase();
         const normalized = normalizeAccountType(accountType);
-        const key = this.buildKey(normalized, upperSymbol, interval);
+        const normalizedInterval = normalizeInterval(interval || DEFAULTS.interval);
+        if (!isSupportedInterval(normalizedInterval)) {
+            throw new Error(`Unsupported interval: ${normalizedInterval}`);
+        }
+        const key = this.buildKey(normalized, upperSymbol, normalizedInterval);
         const cached = this.cache.get(key);
         const explicitEndTime = toNumber(options.endTime, 0);
         const endTime = explicitEndTime > 0 ? explicitEndTime : toNumber(cached?.endTime, nowMs()) || nowMs();
         const lookbackDays = Math.max(1, Math.floor(toNumber(options.lookbackDays, DEFAULTS.lookbackDays)));
         const startTime = toNumber(options.startTime, endTime - lookbackDays * 24 * 60 * 60 * 1000);
-        const toleranceMs = 2 * 60 * 1000;
+        const toleranceMs = Math.max(2 * 60 * 1000, intervalToMs(normalizedInterval) * 2);
         const hasCoverage =
             cached &&
             Array.isArray(cached.candles) &&
@@ -135,7 +160,7 @@ class CandleStore {
         if (hasCoverage) {
             return cached.candles;
         }
-        return await this.fetchAndCacheRange(upperSymbol, normalized, interval, {
+        return await this.fetchAndCacheRange(upperSymbol, normalized, normalizedInterval, {
             startTime,
             endTime,
             lookbackDays,
@@ -144,9 +169,12 @@ class CandleStore {
 
     async getKlines(params = {}, accountType = ACCOUNT_TYPES.SPOT) {
         const symbol = (params.symbol || "").toString().toUpperCase();
-        const interval = (params.interval || DEFAULTS.interval).toString();
+        const interval = normalizeInterval(params.interval || DEFAULTS.interval);
         if (!symbol) {
             return [];
+        }
+        if (!isSupportedInterval(interval)) {
+            throw new Error(`Unsupported interval: ${interval}`);
         }
         const startTime = toNumber(params.startTime, 0);
         const endTime = toNumber(params.endTime, 0) || nowMs();
@@ -164,12 +192,39 @@ class CandleStore {
     }
 
     getLatestClose(symbol = "", accountType = ACCOUNT_TYPES.SPOT, interval = DEFAULTS.interval) {
-        const key = this.buildKey(accountType, (symbol || "").toUpperCase(), interval);
+        const key = this.buildKey(accountType, (symbol || "").toUpperCase(), normalizeInterval(interval || DEFAULTS.interval));
         const cached = this.cache.get(key);
         if (!cached?.candles?.length) {
             return null;
         }
         return cached.candles[cached.candles.length - 1] || null;
+    }
+
+    getLatestCloseAnyInterval(symbol = "", accountType = ACCOUNT_TYPES.SPOT) {
+        const upperSymbol = (symbol || "").toUpperCase();
+        const normalized = normalizeAccountType(accountType);
+        const keyPrefix = `${normalized}:${upperSymbol}:`;
+        let latest = null;
+        for (const [key, cached] of this.cache.entries()) {
+            if (!key.startsWith(keyPrefix)) {
+                continue;
+            }
+            if (!cached?.candles?.length) {
+                continue;
+            }
+            const candidate = cached.candles[cached.candles.length - 1];
+            if (!candidate) {
+                continue;
+            }
+            if (!latest) {
+                latest = candidate;
+                continue;
+            }
+            if (toNumber(candidate.closeTime, candidate.openTime) > toNumber(latest.closeTime, latest.openTime)) {
+                latest = candidate;
+            }
+        }
+        return latest;
     }
 }
 
