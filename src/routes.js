@@ -19,6 +19,14 @@ function normalizeSymbols(input = []) {
     );
 }
 
+function normalizeIntervals(input = []) {
+    return uniq(
+        (Array.isArray(input) ? input : [])
+            .map((interval) => normalizeInterval(interval || DEFAULTS.interval))
+            .filter((interval) => !!interval && isSupportedInterval(interval))
+    );
+}
+
 function createRoutes({ binanceClient, candleStore, replayEngine }) {
     const router = express.Router();
 
@@ -230,15 +238,54 @@ function createRoutes({ binanceClient, candleStore, replayEngine }) {
             const accountType = normalizeAccountType(body.accountType || ACCOUNT_TYPES.FUTURES);
             const speedMultiplier = Math.max(1, Math.floor(toNumber(body.speedMultiplier, DEFAULTS.speedMultiplier)));
             const lookbackDays = Math.max(1, Math.floor(toNumber(body.lookbackDays, DEFAULTS.lookbackDays)));
+            const symbols = normalizeSymbols(body.symbols || []);
+            const requestedIntervals = normalizeIntervals(body.intervals || []);
+            const fallbackInterval = normalizeInterval(body.interval || DEFAULTS.interval);
+            const intervals = requestedIntervals.length
+                ? requestedIntervals
+                : isSupportedInterval(fallbackInterval)
+                    ? [fallbackInterval]
+                    : [DEFAULTS.interval];
+            // eslint-disable-next-line no-console
+            console.log(
+                `[backtesting][${accountType}] control:start requested ` +
+                    `(lookbackDays=${lookbackDays}, speed=${speedMultiplier}x, symbols=${symbols.length}, intervals=${intervals.join(",")})`
+            );
             const status = await replayEngine.start({
                 accountType,
                 speedMultiplier,
                 lookbackDays,
             });
+            let activatedStreams = 0;
+            if (symbols.length) {
+                for (const symbol of symbols) {
+                    for (const interval of intervals) {
+                        await replayEngine.ensureStream({
+                            accountType,
+                            symbol,
+                            interval,
+                            loadNow: false,
+                        });
+                        activatedStreams += 1;
+                    }
+                }
+            }
+            // eslint-disable-next-line no-console
+            console.log(
+                `[backtesting][${accountType}] control:start stream activation done ` +
+                    `(activatedStreams=${activatedStreams}, symbols=${symbols.length}, intervals=${intervals.length})`
+            );
             return res.status(200).json({
                 success: true,
                 message: "Backtest replay started.",
-                data: status,
+                data: {
+                    ...status,
+                    requestedUniverse: {
+                        symbols,
+                        intervals,
+                        activatedStreams,
+                    },
+                },
             });
         } catch (e) {
             return res.status(500).json({
@@ -252,6 +299,8 @@ function createRoutes({ binanceClient, candleStore, replayEngine }) {
         try {
             const body = req.body || {};
             const accountType = normalizeAccountType(body.accountType || ACCOUNT_TYPES.FUTURES);
+            // eslint-disable-next-line no-console
+            console.log(`[backtesting][${accountType}] control:stop requested`);
             const status = replayEngine.stop(accountType);
             return res.status(200).json({
                 success: true,

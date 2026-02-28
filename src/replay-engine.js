@@ -86,6 +86,9 @@ class ReplayEngine extends EventEmitter {
             tickBusy: false,
             startedAt: null,
             endedAt: null,
+            lastProgressEmitAt: 0,
+            lastProgressEmitPercent: -1,
+            lastNoStreamEmitAt: 0,
         };
     }
 
@@ -191,6 +194,72 @@ class ReplayEngine extends EventEmitter {
             return null;
         }
         return session.latestBySymbol[upperSymbol];
+    }
+
+    buildProgressPayload(session = null, reason = "tick") {
+        if (!session) {
+            return null;
+        }
+        const activeStreamStates = this.getActiveStreamStates(session);
+        const symbols = uniq(activeStreamStates.map((stream) => stream.symbol));
+        const intervals = uniq(activeStreamStates.map((stream) => stream.interval));
+        const index = Math.max(0, Math.floor(toNumber(session.replayIndex, 0)));
+        const total = Math.max(0, Math.floor(toNumber(session.replayTotal, 0)));
+        const safePercent = total > 0 ? Math.min(100, (index / total) * 100) : 0;
+        const elapsedMs =
+            toNumber(session.startedAt, 0) > 0 ? Math.max(0, nowMs() - toNumber(session.startedAt, 0)) : 0;
+        const remainingTicks = Math.max(0, total - index);
+        const etaMs = session.running ? remainingTicks * Math.max(1, toNumber(session.tickMs, 1)) : 0;
+        return {
+            accountType: session.accountType,
+            running: !!session.running,
+            reason,
+            lookbackDays: session.lookbackDays,
+            speedMultiplier: session.speedMultiplier,
+            tickMs: session.tickMs,
+            startedAt: session.startedAt,
+            endedAt: session.endedAt,
+            replayCursor: {
+                index,
+                total,
+                openTime: index > 0 ? session.replayClockMs : null,
+            },
+            progressPct: Number(safePercent.toFixed(2)),
+            elapsedMs,
+            etaMs,
+            streams: {
+                count: activeStreamStates.length,
+                symbols,
+                intervals,
+            },
+        };
+    }
+
+    emitProgress(session = null, reason = "tick", force = false) {
+        if (!session) {
+            return;
+        }
+        const payload = this.buildProgressPayload(session, reason);
+        if (!payload) {
+            return;
+        }
+        const now = nowMs();
+        const index = toNumber(payload?.replayCursor?.index, 0);
+        const total = Math.max(0, toNumber(payload?.replayCursor?.total, 0));
+        const percent = toNumber(payload?.progressPct, 0);
+        const shouldEmit =
+            !!force ||
+            reason !== "tick" ||
+            index <= 1 ||
+            (total > 0 && index >= total) ||
+            now - toNumber(session.lastProgressEmitAt, 0) >= 1000 ||
+            percent >= toNumber(session.lastProgressEmitPercent, -1) + 1;
+        if (!shouldEmit) {
+            return;
+        }
+        session.lastProgressEmitAt = now;
+        session.lastProgressEmitPercent = percent;
+        this.emit("progress", payload);
     }
 
     buildWsPayload(candle = null, symbol = "", interval = DEFAULTS.interval) {
@@ -371,6 +440,7 @@ class ReplayEngine extends EventEmitter {
             this.sessions[normalized] = session;
         }
         const key = this.buildStreamKey(symbol, interval);
+        let activated = false;
         if (!session.streams[key]) {
             session.streams[key] = {
                 key,
@@ -384,11 +454,16 @@ class ReplayEngine extends EventEmitter {
                 windowStart: 0,
                 windowEnd: 0,
             };
+            activated = true;
         } else {
+            activated = !session.streams[key].active;
             session.streams[key].active = true;
         }
         if (options.loadNow !== false) {
             await this.ensureStreamDataLoaded(session, session.streams[key]);
+        }
+        if (activated) {
+            this.emitProgress(session, "stream_subscribed", true);
         }
         return session.streams[key];
     }
@@ -413,6 +488,7 @@ class ReplayEngine extends EventEmitter {
         if (!symbolStillActive) {
             delete session.latestBySymbol[symbol];
         }
+        this.emitProgress(session, "stream_unsubscribed", true);
         return true;
     }
 
@@ -439,7 +515,7 @@ class ReplayEngine extends EventEmitter {
         }
     }
 
-    stop(accountType = ACCOUNT_TYPES.SPOT) {
+    stop(accountType = ACCOUNT_TYPES.SPOT, reason = "stopped") {
         const normalized = normalizeAccountType(accountType);
         const session = this.sessions[normalized];
         if (!session) {
@@ -452,6 +528,7 @@ class ReplayEngine extends EventEmitter {
         session.running = false;
         session.tickBusy = false;
         session.endedAt = nowMs();
+        this.emitProgress(session, reason, true);
         this.emit("stopped", { accountType: normalized, status: this.getStatus(normalized) });
         return this.getStatus(normalized);
     }
@@ -469,6 +546,7 @@ class ReplayEngine extends EventEmitter {
         session.endedAt = null;
         this.sessions[normalized] = session;
         this.emit("started", { accountType: normalized, status: this.getStatus(normalized) });
+        this.emitProgress(session, "started", true);
 
         const emitTick = async () => {
             if (!session.running || session.tickBusy) {
@@ -476,12 +554,16 @@ class ReplayEngine extends EventEmitter {
             }
             const activeStreams = this.getActiveStreamStates(session);
             if (!activeStreams.length) {
+                if (nowMs() - toNumber(session.lastNoStreamEmitAt, 0) >= 5000) {
+                    session.lastNoStreamEmitAt = nowMs();
+                    this.emitProgress(session, "waiting_streams", true);
+                }
                 return;
             }
             session.tickBusy = true;
             try {
                 if (session.replayIndex >= session.replayTotal) {
-                    this.stop(normalized);
+                    this.stop(normalized, "completed");
                     return;
                 }
                 session.replayIndex += 1;
@@ -492,9 +574,10 @@ class ReplayEngine extends EventEmitter {
                     await this.ensureStreamDataLoaded(session, stream);
                     this.emitStreamCandlesToClock(session, stream, session.replayClockMs);
                 }
+                this.emitProgress(session, "tick", false);
 
                 if (session.replayClockMs >= session.endTime || session.replayIndex >= session.replayTotal) {
-                    this.stop(normalized);
+                    this.stop(normalized, "completed");
                 }
             } finally {
                 session.tickBusy = false;
