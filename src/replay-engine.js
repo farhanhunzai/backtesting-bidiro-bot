@@ -265,6 +265,34 @@ class ReplayEngine extends EventEmitter {
         }
     }
 
+    syncStreamCursorToLastVisibleOpenTime(session = null, state = null, lastVisibleOpenTime = 0) {
+        if (!session || !state || !Array.isArray(state.candles) || !state.candles.length) {
+            if (state) {
+                state.cursor = 0;
+            }
+            return;
+        }
+        const target = toNumber(lastVisibleOpenTime, 0);
+        if (target <= 0) {
+            this.syncStreamCursorWithClock(session, state);
+            return;
+        }
+        let low = 0;
+        let high = state.candles.length;
+        while (low < high) {
+            const mid = Math.floor((low + high) / 2);
+            if (toNumber(state.candles[mid]?.openTime, 0) <= target) {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        state.cursor = low;
+        if (state.cursor > 0) {
+            this.setLatestPrice(session, state.symbol, state.candles[state.cursor - 1]);
+        }
+    }
+
     async ensureStreamDataLoaded(session = null, state = null) {
         if (!session || !state || !state.active) {
             return;
@@ -284,7 +312,6 @@ class ReplayEngine extends EventEmitter {
                 state.windowEnd < session.endTime &&
                 toNumber(session.replayClockMs, 0) >= (state.windowEnd - prefetchLeadMs);
             if (!shouldExtend) {
-                this.syncStreamCursorWithClock(session, state);
                 return;
             }
             desiredEnd = Math.min(session.endTime, state.windowEnd + chunkMs);
@@ -299,6 +326,10 @@ class ReplayEngine extends EventEmitter {
             return;
         }
         state.loadingPromise = (async () => {
+            const previousVisibleOpenTime =
+                state.cursor > 0 && Array.isArray(state.candles) && state.candles[state.cursor - 1]
+                    ? toNumber(state.candles[state.cursor - 1]?.openTime, 0)
+                    : 0;
             const candles = await this.candleStore.ensureRange(state.symbol, session.accountType, state.interval, {
                 startTime: desiredStart,
                 endTime: desiredEnd,
@@ -310,7 +341,12 @@ class ReplayEngine extends EventEmitter {
             state.loaded = true;
             state.windowStart = desiredStart;
             state.windowEnd = desiredEnd;
-            this.syncStreamCursorWithClock(session, state);
+            if (previousVisibleOpenTime > 0) {
+                this.syncStreamCursorToLastVisibleOpenTime(session, state, previousVisibleOpenTime);
+            } else {
+                // On initial stream load, align cursor to current replay clock so only forward candles are emitted.
+                this.syncStreamCursorWithClock(session, state);
+            }
         })();
         try {
             await state.loadingPromise;
