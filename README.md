@@ -7,6 +7,7 @@ This project is designed so any trading client that already talks to Binance-sty
 ## What It Does
 
 - Fetches historical candles from Binance (Spot or Futures) for allowed intervals.
+- Persists candles in a local SQLite store so restarts reuse existing history.
 - Caches candle windows in memory for fast repeated access.
 - Creates replay sessions per account type (`SPOT`, `FUTURES`).
 - Emits candle updates over WebSocket in accelerated time.
@@ -16,6 +17,7 @@ This project is designed so any trading client that already talks to Binance-sty
 
 - Supports multiple intervals (`1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `6h`, `8h`, `12h`, `1d`, `3d`, `1w`, `1M` by default).
 - Stream data is fetched lazily per `symbol + interval` when that stream is subscribed/requested.
+- Fetching is incremental: only missing candle gaps are downloaded, then persisted.
 - Replay speed is controlled by `speedMultiplier`.
 - `klines` output is replay-aware: it will not expose candles ahead of the current replay cursor.
 - `bookTicker` prefers replay price while a session is running, then falls back to latest cached/live price.
@@ -25,10 +27,23 @@ This project is designed so any trading client that already talks to Binance-sty
 
 - `src/index.js`: boots Express + HTTP server + WebSocket gateway.
 - `src/routes.js`: REST APIs (Binance-compatible routes + replay control routes).
+- `src/candle-db.js`: persistent SQLite layer (`candles` + `sync_state` tables).
 - `src/candle-store.js`: candle fetching, caching, slicing, and response formatting.
 - `src/replay-engine.js`: session lifecycle, timeline replay, and event emission.
 - `src/ws-gateway.js`: Binance-style WS subscribe/unsubscribe stream handling.
 - `src/binance-client.js`: upstream Binance REST calls.
+
+## Persistence Model
+
+- Local DB: SQLite (`data/candles.sqlite` by default).
+- Primary key: `accountType + symbol + interval + openTime`.
+- On every kline load request:
+  1. Read from local DB first.
+  2. Detect missing candle ranges for requested time window.
+  3. Fetch only those missing ranges from Binance.
+  4. Upsert fetched rows into local DB.
+- On restart, existing history is reused and only new/missing candles are fetched.
+- Sync metadata tracks coverage and upstream temporary bans (`banned until`) per stream key.
 
 ## Replay Session Lifecycle
 
@@ -46,7 +61,7 @@ This project is designed so any trading client that already talks to Binance-sty
 ### Health
 
 - `GET /health`
-  - Returns service time and session status for both account types.
+  - Returns service time, replay sessions, and storage status.
 
 ### Binance-Compatible REST
 
@@ -70,6 +85,8 @@ Notes:
 - `GET /backtest/session/status?accountType=SPOT|FUTURES`
 - `POST /backtest/session/start`
 - `POST /backtest/session/stop`
+- `GET /backtest/storage/status`
+- `GET /backtest/storage/sync?accountType=FUTURES&symbol=BTCUSDT&interval=1m`
 
 `start` request body:
 
@@ -120,6 +137,12 @@ Environment variables:
 - `BACKTEST_BINANCE_TIMEOUT_MS` default: `15000`
 - `BACKTEST_ALLOWED_INTERVALS` optional comma-separated override for allowed intervals
 - `BACKTEST_CONTROL_TOKEN` optional, secures `/backtest/session/*`
+- `BACKTEST_CANDLE_DB_DISABLED` set `1` to disable persistent DB and run memory-only
+- `BACKTEST_CANDLE_DB_PATH` custom path for SQLite DB file
+
+Notes:
+- If `BACKTEST_CONTROL_TOKEN` is set, it also secures `/backtest/storage/*`.
+- Keep `data/` on local disk (or mounted volume) to preserve candles across restarts.
 
 ## Run Locally
 
@@ -172,6 +195,9 @@ curl "http://localhost:3900/fapi/v1/klines?symbol=BTCUSDT&interval=5m&limit=200"
 
 ## Troubleshooting
 
+- Repeated Binance fetches after restart:
+  - Ensure `BACKTEST_CANDLE_DB_DISABLED` is not `1`.
+  - Check `/backtest/storage/status` for `enabled: true` and growing `candleRows`.
 - Session starts but no movement:
   - Ensure at least one stream is subscribed (or call klines for a symbol/interval) so data loading starts.
   - Check `/health` and verify `running: true` and replay cursor advancing.

@@ -5,6 +5,7 @@ const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
 const BinanceClient = require("./binance-client");
+const CandleDb = require("./candle-db");
 const CandleStore = require("./candle-store");
 const ReplayEngine = require("./replay-engine");
 const WsGateway = require("./ws-gateway");
@@ -17,8 +18,18 @@ app.use(cors({ origin: "*" }));
 app.use(express.json({ limit: "1mb" }));
 
 const binanceClient = new BinanceClient();
-const candleStore = new CandleStore(binanceClient);
+const persistenceEnabled = (process.env.BACKTEST_CANDLE_DB_DISABLED || "").toString().trim() !== "1";
+const candleDb = persistenceEnabled ? new CandleDb() : null;
+const candleStore = new CandleStore(binanceClient, candleDb);
 const replayEngine = new ReplayEngine(candleStore);
+
+if (candleDb) {
+    // eslint-disable-next-line no-console
+    console.log(`[backtesting] persistent candle DB enabled (${candleDb.filePath})`);
+} else {
+    // eslint-disable-next-line no-console
+    console.log("[backtesting] persistent candle DB disabled");
+}
 
 function formatDuration(ms = 0) {
     const safe = Math.max(0, Math.floor(ms || 0));
@@ -97,3 +108,15 @@ server.listen(port, () => {
     // eslint-disable-next-line no-console
     console.log(`[backtesting] listening on :${port}`);
 });
+
+function shutdown() {
+    try {
+        if (candleDb) {
+            candleDb.close();
+        }
+    } catch (_e) {}
+    process.exit(0);
+}
+
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);

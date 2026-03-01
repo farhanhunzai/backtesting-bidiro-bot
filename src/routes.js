@@ -50,6 +50,7 @@ function createRoutes({ binanceClient, candleStore, replayEngine }) {
             success: true,
             now: nowMs(),
             sessions: replayEngine.getAllStatuses(),
+            storage: candleStore.getStorageStatus(),
         });
     });
 
@@ -229,6 +230,35 @@ function createRoutes({ binanceClient, candleStore, replayEngine }) {
         return res.status(200).json({
             success: true,
             data: replayEngine.getStatus(accountType),
+        });
+    });
+
+    router.get("/backtest/storage/status", requireControlToken, (req, res) => {
+        return res.status(200).json({
+            success: true,
+            data: candleStore.getStorageStatus(),
+        });
+    });
+
+    router.get("/backtest/storage/sync", requireControlToken, (req, res) => {
+        const accountType = normalizeAccountType(req.query.accountType || ACCOUNT_TYPES.FUTURES);
+        const symbol = (req.query.symbol || "").toString().trim().toUpperCase();
+        const interval = normalizeInterval(req.query.interval || DEFAULTS.interval);
+        if (!symbol) {
+            return res.status(400).json({
+                success: false,
+                message: "symbol is required",
+            });
+        }
+        return res.status(200).json({
+            success: true,
+            data: {
+                accountType,
+                symbol,
+                interval,
+                coverage: candleStore.getCoverage(accountType, symbol, interval),
+                sync: candleStore.getSyncState(accountType, symbol, interval),
+            },
         });
     });
 
